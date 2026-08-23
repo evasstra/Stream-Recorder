@@ -5,6 +5,14 @@ import timer from 'minimal-timer'
 // Smaller chunksize is nice since, in case of errors, it has almost always stored something.
 // No losing 15mins of recording for one error.
 const CHUNKSIZE = 500
+const START_TIMEOUT = 5000
+const STOP_TIMEOUT = 5000
+const WORKER_TIMEOUT = 10000
+const WEBM_TYPES = [
+	'video/webm;codecs=vp8,opus',
+	'video/webm;codecs=vp9,opus',
+	'video/webm'
+]
 // How long is too long for worker? Let's say 10min.
 const LONG_DURATION = 10 * 60 * 1000
 
@@ -71,6 +79,11 @@ export default class LiveRecorder extends HyperHTMLElement {
 			// this.data doesn't affect render.
 			this.data = []
 			this.audioIsConnected = false
+			this.operation = null
+			this.captureCleanup = null
+			this.audioSource = null
+			this.stopPromise = null
+			this.captureStrategy = null
 			
 			this.timer = timer()
 			let fullhostname = window.location.hostname.replace('www.', '');
@@ -81,7 +94,7 @@ export default class LiveRecorder extends HyperHTMLElement {
 
 			var result = parturl.substring(last + 1);
 			if (result == '') {
-				var result = parturl.split("/").reverse()[1];
+				result = parturl.split("/").reverse()[1];
 			}
 			const timeStamp = (new Date()).toISOString().replace(/[^0-9]/g, '-').slice(0, -8)
 			let bongacams = /^\D{2}.bongacams/;
@@ -214,8 +227,7 @@ export default class LiveRecorder extends HyperHTMLElement {
 
 	async handleClose() {
 		this.classList.add('live-recorder-none')
-		this.stop()
-		this.data=[]
+		await this.stop()
 	}
 
 	async handleStatus() {
@@ -259,105 +271,60 @@ export default class LiveRecorder extends HyperHTMLElement {
 	}
 
 	async handleStartStop(){
-		if (this.data.length > 0) {
-			this.save()
-		}
-		// log('startstop')
-		// log(this, this.targetElement, this.data, this.state)
-		//log("HELLO?")
-		//log('this',this.state)
-		if (this.state == null)
-			this.setState( this.defaultState )
-		//log(this.state)
-		this.handleStatus()
-		log(this.state, this.state.recorder.state)
-		if (this.state.recorder.state  === 'inactive') {
-			// log('start')
-			// Call stop first. No harm in doing so.
-			await this.stop()
-			await this.start()
-			// log('started', this.state)
-		} else {
-			//log('stop')
-			await this.stop()
-			//log('stopped', this.state)
+		if (this.operation != null) return
+		if (this.state == null) this.setState(this.defaultState)
+		await this.handleStatus()
+		this.operation = this.state.recorder.state === 'inactive' ? 'starting' : 'stopping'
+		try {
+			if (this.state.recorder.state === 'inactive') await this.start()
+			else await this.stop()
+		} finally {
+			this.operation = null
 		}
 	}
 
 	async start() {
-		// log('in start')
-		// Capturing mutes audio (Firefox bug).
-		const capture = HTMLMediaElement.prototype.captureStream 
-						|| HTMLMediaElement.prototype.mozCaptureStream
-		const stream = capture.call(this.targetElement)
-		// "Unmute".
-		// Only need to do this once.
-		if (!this.audioIsConnected) {
-			// Try-catch because media without audio will mess up otherwise.
-			try {
-				const context = LiveRecorder.audioContext
-				const source = context.createMediaStreamSource(stream)
-				source.connect(context.destination)
-				log('pluggin')
-				this.audioIsConnected = true
-			} catch(e) {
-				// nothing
+		try {
+			await this.targetElement.play()
+			const capture = createCapture(this.targetElement)
+			const stream = capture.stream
+			this.captureCleanup = capture.cleanup
+			this.captureStrategy = capture.strategy
+
+			if (capture.strategy === 'mozCaptureStream' && stream.getAudioTracks().length > 0) {
+				try {
+					const context = LiveRecorder.audioContext
+					await context.resume()
+					this.audioSource = context.createMediaStreamSource(stream)
+					this.audioSource.connect(context.destination)
+					this.audioIsConnected = true
+				} catch(e) { /* recording can continue without loopback */ }
 			}
+
+			const mimeType = getSupportedMimeType()
+			const recorder = new MediaRecorder(stream, mimeType === '' ? {} : { mimeType })
+			this.data = []
+			recorder.ondataavailable = e => {
+				if (e.data && e.data.size > 0) this.data.push(e.data)
+			}
+			recorder.onpause = log
+			recorder.onresume = log
+			this.stopPromise = new Promise(resolve => { recorder.onstop = resolve })
+			recorder.onerror = e => {
+				if (this.operation != null) return
+				this.operation = 'stopping'
+				this.error(e.error || recorderError('MediaRecorderError', 'Recording failed.'))
+					.finally(() => { this.operation = null })
+			}
+
+			await startRecorder(recorder, CHUNKSIZE, START_TIMEOUT)
+			this.timer.start()
+			this.setState({ recorder })
+		} catch(e) {
+			await this.cleanupCapture()
+			await this.error(e)
 		}
-
-		// Apparently recorder types on android = no-go?
-		// https://github.com/streamproc/MediaStreamRecorder/blob/master/MediaStreamRecorder.js#L1118
-		// Testing & hoping for feedback.
-		// MediaRecorder actually converts filetypes with the mimetype argument.
-		// Surprising, even after reading the docs...
-		const recorder = new MediaRecorder(stream, { mimeType: 'video/webm' })
-		const data = []
-		recorder.ondataavailable = e => { log(e); data.push(e.data) }
-
-		// These don't work.
-		// https://bugzilla.mozilla.org/show_bug.cgi?id=1363915
-		// Update: they work now. v.65+. What was I supposed to do with em?
-		recorder.onpause = log
-		recorder.onresume = log
-
-		/**
-		 * Considering 'recorder' is instance specific,
-		 * it's okay to use .onstop type listeners.
-		 * One usually wants to avoid them in extensions
-		 * as they steal potential existing listeners
-		 * by the website.
-		 */
-		const stopped = new Promise((res, rej) => {
-			recorder.onstop = () => res(this.timer.stop())
-			recorder.onerror = async () => {
-				this.stop().then(() => {
-					rej({ name:'Unknown error', message: 'unlucky.' })
-				})
-			}
-		})
-
-		// Possible error message gets overwritten by an error with recorder?
-		// Like: play() errors, now trying to recorder.start() regardless,
-		//  -> error2 from recorder -> overwrite error 1.
-		await this.targetElement.play().catch(e => this.error(e))
-
-		const started = new Promise(res => {
-			// Will throw (reject) if start fails.
-			recorder.onstart = () => res(this.timer.start())
-			recorder.start(CHUNKSIZE)
-		})
-
-		this.data = data
-
-		// Triggers render.
-		started.then(() => this.setState({ recorder }))
-			.then(() => stopped)
-			.catch(error => this.error(error))
-			// .then(() => this.revokeExistingURL())
-			// .catch(error => this.error(error))
-		log('start finished. state:', this.state)
 	}
-
 	async error(e) {
 		//log('error', e, e.name, e.message)
 		let error
@@ -369,8 +336,7 @@ export default class LiveRecorder extends HyperHTMLElement {
 		} else {
 			error = 'Undefined error. Stopped.'
 		}
-		this.stop()
-
+		await this.stop()
 		//log( this.state )
 
 		this.setState({
@@ -379,21 +345,38 @@ export default class LiveRecorder extends HyperHTMLElement {
 	}
 
 	async stop() {
-		//log('in stop', this.state)
-		if (this.state.recorder && this.state.recorder.state !== 'inactive') { 
+		const recorder = this.state.recorder
+		if (recorder && recorder.state !== 'inactive') {
 			this.timer.stop()
-			this.state.recorder.stop()
-			this.save()
-			this.data = []
-			this.render()
+			recorder.stop()
+			if (this.stopPromise != null) {
+				await Promise.race([this.stopPromise, delay(STOP_TIMEOUT)])
+			}
 		}
+		await this.cleanupCapture()
+		this.stopPromise = null
+		this.setState({ recorder: { state: 'inactive' } })
+		await this.save()
 	}
 
+	async cleanupCapture() {
+		if (this.audioSource != null) {
+			try { this.audioSource.disconnect() } catch(e) { /* nop */ }
+			this.audioSource = null
+			this.audioIsConnected = false
+		}
+		if (this.captureCleanup != null) {
+			this.captureCleanup()
+			this.captureCleanup = null
+		}
+		this.captureStrategy = null
+	}
 	/**
 	 * Wire up the save button.
 	 */
 	async save() {
 		if (this.data.length === 0) {
+			this.setState({ error: 'Whoops: Firefox produced no recording data.' })
 			return
 		}
 		//log('preocessing')
@@ -410,11 +393,15 @@ export default class LiveRecorder extends HyperHTMLElement {
 		// "Cannot load from moz-exte...."
 		const downloadURL = URL.createObjectURL(blob)
 		const a = document.createElement("a")
-		a.download = this.fileTitle
+		a.download = this.fileTitle + '.webm'
 		a.href = downloadURL
+		document.body.appendChild(a)
 		a.click()
-		URL.revokeObjectURL(downloadURL)
+		a.remove()
+		// Firefox may consume the object URL asynchronously.
+		setTimeout(() => URL.revokeObjectURL(downloadURL), 60 * 1000)
 		this.data = []
+		this.setState({ error: 'Whoops: Download started. Check Firefox Downloads.' })
 	}
 }
 
@@ -432,13 +419,85 @@ function log(...args) {
  * Good = duration fixed.
  * Before changing this, consider that there are a lot of CSP issues.
  */
+export function createCapture(mediaElement) {
+	const source = mediaElement.srcObject
+	if (typeof MediaStream !== 'undefined' && source instanceof MediaStream) {
+		const tracks = source.getTracks().filter(track => track.readyState === 'live')
+		if (tracks.length === 0) throw recorderError('NotSupportedError', 'The live stream has no active media tracks.')
+		return captureResult(new MediaStream(tracks.map(track => track.clone())), 'srcObject-clone', true)
+	}
+
+	const candidates = []
+	if (typeof mediaElement.mozCaptureStream === 'function') candidates.push(['mozCaptureStream', mediaElement.mozCaptureStream])
+	if (typeof mediaElement.captureStream === 'function') candidates.push(['captureStream', mediaElement.captureStream])
+	if (candidates.length === 0) throw recorderError('NotSupportedError', 'This media element cannot be captured by Firefox.')
+
+	let lastError
+	for (const candidate of candidates) {
+		try {
+			const stream = candidate[1].call(mediaElement)
+			if (stream && stream.getTracks().some(track => track.readyState === 'live')) return captureResult(stream, candidate[0], false)
+			lastError = recorderError('NotSupportedError', candidate[0] + ' returned no active media tracks.')
+		} catch(e) {
+			lastError = e
+		}
+	}
+	throw lastError
+}
+
+function captureResult(stream, strategy, ownsTracks) {
+	return {
+		stream,
+		strategy,
+		// Only stop tracks cloned by this extension. Stopping Firefox element-capture
+		// tracks can propagate to the live player and interrupt playback.
+		cleanup: ownsTracks ? () => stream.getTracks().forEach(track => track.stop()) : () => {}
+	}
+}
+
+export function getSupportedMimeType() {
+	if (typeof MediaRecorder.isTypeSupported !== 'function') return 'video/webm'
+	for (const mimeType of WEBM_TYPES) {
+		if (MediaRecorder.isTypeSupported(mimeType)) return mimeType
+	}
+	return ''
+}
+
+export function startRecorder(recorder, timeslice, timeout) {
+	return new Promise((resolve, reject) => {
+		const timeoutID = setTimeout(() => {
+			if (recorder.state !== 'inactive') recorder.stop()
+			reject(recorderError('TimeoutError', 'Firefox did not start recording within ' + timeout + ' ms.'))
+		}, timeout)
+		recorder.onstart = () => {
+			clearTimeout(timeoutID)
+			resolve()
+		}
+		try { recorder.start(timeslice) } catch(e) {
+			clearTimeout(timeoutID)
+			reject(e)
+		}
+	})
+}
+
+function recorderError(name, message) {
+	const error = new Error(message)
+	error.name = name
+	return error
+}
 function workIt(buggyBlob, duration){
-	// log('duration', duration)
+	// Fall back to the original playable WebM if duration repair stalls.
 	return new Promise((resolve) => {
+		const timeoutID = setTimeout(() => resolve(buggyBlob), WORKER_TIMEOUT)
 		window.liveRecorder.worker.onmessage = e => {
+			clearTimeout(timeoutID)
 			resolve(e.data)
 		}
 		window.liveRecorder.worker.postMessage({buggyBlob, duration})
 	})
+}
+
+function delay(duration) {
+	return new Promise(resolve => setTimeout(resolve, duration))
 }
 

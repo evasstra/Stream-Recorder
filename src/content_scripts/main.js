@@ -19,7 +19,7 @@ import LiveRecorder from './Recorder.js'
 		window.liveRecorder = {}
 		window.liveRecorder.uniqueID = 1
 		window.liveRecorder.injected = true
-		window.liveRecorder.worker = new Worker(browser.extension.getURL('') + 'live-recorder-worker-bundle.js')
+		window.liveRecorder.worker = new Worker(browser.runtime.getURL('') + 'live-recorder-worker-bundle.js')
 	}
 
 	Array.prototype.forEach.call(elements, addRecorder)

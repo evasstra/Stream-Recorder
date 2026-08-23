@@ -22,9 +22,15 @@
   "web_accessible_resources": [
     "/live-recorder-worker-bundle.js"
   ],
-  "applications": {
+  "browser_specific_settings": {
     "gecko": {
-      "strict_min_version": "63.0"
+      "id": "stream-recorder-local@local.invalid",
+      "data_collection_permissions": {
+        "required": [
+          "none"
+        ]
+      },
+      "strict_min_version": "142.0"
     }
   }
 }

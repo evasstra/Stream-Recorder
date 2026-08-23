@@ -12,7 +12,7 @@ module.exports = {
 		overwriteDest: true
 	},
 	ignoreFiles: [
-		'*config.js',
+		'*config.*',
 		'icons/*.png',
 		'**/*.webm',
 		'Screenshots',
