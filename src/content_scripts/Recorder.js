@@ -15,6 +15,10 @@ const WEBM_TYPES = [
 ]
 // How long is too long for worker? Let's say 10min.
 const LONG_DURATION = 10 * 60 * 1000
+// Finish a part before LONG_DURATION so duration repair never receives a blob
+// that is too large for the worker. The margin also leaves room for the final
+// MediaRecorder chunk to arrive after stop() is requested.
+const AUTO_SPLIT_DURATION = LONG_DURATION - 30 * 1000
 
 /** 
  * All in all, the mozCaptureStream is (still) very buggy.
@@ -84,6 +88,10 @@ export default class LiveRecorder extends HyperHTMLElement {
 			this.audioSource = null
 			this.stopPromise = null
 			this.captureStrategy = null
+			this.recordingStream = null
+			this.segmentNumber = 1
+			this.isSegmentedRecording = false
+			this.rolloverScheduled = false
 			
 			this.timer = timer()
 			let fullhostname = window.location.hostname.replace('www.', '');
@@ -226,6 +234,7 @@ export default class LiveRecorder extends HyperHTMLElement {
 	}
 
 	async handleClose() {
+		if (this.operation != null) return
 		this.classList.add('live-recorder-none')
 		await this.stop()
 	}
@@ -285,9 +294,12 @@ export default class LiveRecorder extends HyperHTMLElement {
 
 	async start() {
 		try {
+			this.segmentNumber = 1
+			this.isSegmentedRecording = false
 			await this.targetElement.play()
 			const capture = createCapture(this.targetElement)
 			const stream = capture.stream
+			this.recordingStream = stream
 			this.captureCleanup = capture.cleanup
 			this.captureStrategy = capture.strategy
 
@@ -301,29 +313,92 @@ export default class LiveRecorder extends HyperHTMLElement {
 				} catch(e) { /* recording can continue without loopback */ }
 			}
 
-			const mimeType = getSupportedMimeType()
-			const recorder = new MediaRecorder(stream, mimeType === '' ? {} : { mimeType })
 			this.data = []
-			recorder.ondataavailable = e => {
-				if (e.data && e.data.size > 0) this.data.push(e.data)
-			}
-			recorder.onpause = log
-			recorder.onresume = log
-			this.stopPromise = new Promise(resolve => { recorder.onstop = resolve })
-			recorder.onerror = e => {
-				if (this.operation != null) return
-				this.operation = 'stopping'
-				this.error(e.error || recorderError('MediaRecorderError', 'Recording failed.'))
-					.finally(() => { this.operation = null })
-			}
-
-			await startRecorder(recorder, CHUNKSIZE, START_TIMEOUT)
+			const recorder = await this.startSegment(stream)
 			this.timer.start()
 			this.setState({ recorder })
 		} catch(e) {
 			await this.cleanupCapture()
 			await this.error(e)
 		}
+	}
+
+	async startSegment(stream, data = this.data) {
+		const mimeType = getSupportedMimeType()
+		const recorder = new MediaRecorder(stream, mimeType === '' ? {} : { mimeType })
+		recorder.ondataavailable = e => {
+			// Keep each recorder tied to its own array. A delayed final event from a
+			// stopped recorder must never land in the next segment.
+			if (e.data && e.data.size > 0) data.push(e.data)
+			if (this.timer.elapsedTime() >= AUTO_SPLIT_DURATION) this.scheduleRollover()
+		}
+		recorder.onpause = log
+		recorder.onresume = log
+		this.stopPromise = new Promise(resolve => { recorder.onstop = resolve })
+		recorder.onerror = e => {
+			if (this.operation != null) return
+			this.operation = 'stopping'
+			this.error(e.error || recorderError('MediaRecorderError', 'Recording failed.'))
+				.finally(() => { this.operation = null })
+		}
+		await startRecorder(recorder, CHUNKSIZE, START_TIMEOUT)
+		return recorder
+	}
+
+	scheduleRollover() {
+		if (this.rolloverScheduled || this.operation != null) return
+		this.rolloverScheduled = true
+		Promise.resolve().then(async () => {
+			if (this.operation != null || this.state.recorder.state === 'inactive') {
+				this.rolloverScheduled = false
+				return
+			}
+			this.operation = 'rolling-over'
+			try {
+				await this.rollover()
+			} catch(e) {
+				await this.error(e)
+			} finally {
+				this.operation = null
+				this.rolloverScheduled = false
+			}
+		})
+	}
+
+	async rollover() {
+		const recorder = this.state.recorder
+		if (!recorder || recorder.state === 'inactive') return
+
+		this.timer.stop()
+		recorder.stop()
+		if (this.stopPromise != null) {
+			await Promise.race([this.stopPromise, delay(STOP_TIMEOUT)])
+		}
+
+		const completedData = this.data
+		const completedDuration = this.timer.elapsedTime()
+		const completedSegmentNumber = this.segmentNumber
+		this.isSegmentedRecording = true
+		this.data = []
+
+		// Restart on the existing capture before processing the completed part so
+		// a slow duration-repair worker does not create a gap in the recording.
+		let nextRecorder
+		try {
+			nextRecorder = await this.startSegment(this.recordingStream)
+		} catch(e) {
+			// The completed part is still valid even if recording cannot continue.
+			await this.save(completedData, completedDuration, completedSegmentNumber, true)
+			throw e
+		}
+		this.segmentNumber += 1
+		this.timer.start()
+		this.setState({ recorder: nextRecorder })
+
+		await this.save(completedData, completedDuration, completedSegmentNumber, true)
+		this.setState({
+			error: 'Whoops: Part ' + padSegmentNumber(completedSegmentNumber) + ' saved. Recording continues.'
+		})
 	}
 	async error(e) {
 		//log('error', e, e.name, e.message)
@@ -354,6 +429,7 @@ export default class LiveRecorder extends HyperHTMLElement {
 			}
 		}
 		await this.cleanupCapture()
+		this.recordingStream = null
 		this.stopPromise = null
 		this.setState({ recorder: { state: 'inactive' } })
 		await this.save()
@@ -374,33 +450,28 @@ export default class LiveRecorder extends HyperHTMLElement {
 	/**
 	 * Wire up the save button.
 	 */
-	async save() {
-		if (this.data.length === 0) {
+	async save(data = this.data, time = this.timer.elapsedTime(), segmentNumber = this.segmentNumber, segmented = this.isSegmentedRecording) {
+		if (data.length === 0) {
 			this.setState({ error: 'Whoops: Firefox produced no recording data.' })
 			return
 		}
 		//log('preocessing')
-		const buggyBlob = new Blob(this.data, { type: 'video/webm' })
-		const time = this.timer.elapsedTime()
+		const buggyBlob = new Blob(data, { type: 'video/webm' })
 		let blob = buggyBlob;
 		// Send to worker, unless duration is long, which causes worker to work forever.
-		if (time < LONG_DURATION) {
-			blob = await workIt(buggyBlob, time)
-		} else {
-			this.error({ message: 'File is too big to process duration metadata.', name: 'Whoops'})
-		}
+		if (time < LONG_DURATION) blob = await workIt(buggyBlob, time)
 		// Creating the url in the worker results in CSP fiesta.
 		// "Cannot load from moz-exte...."
 		const downloadURL = URL.createObjectURL(blob)
 		const a = document.createElement("a")
-		a.download = this.fileTitle + '.webm'
+		a.download = this.fileTitle + (segmented ? '.part-' + padSegmentNumber(segmentNumber) : '') + '.webm'
 		a.href = downloadURL
 		document.body.appendChild(a)
 		a.click()
 		a.remove()
 		// Firefox may consume the object URL asynchronously.
 		setTimeout(() => URL.revokeObjectURL(downloadURL), 60 * 1000)
-		this.data = []
+		if (data === this.data) this.data = []
 		this.setState({ error: 'Whoops: Download started. Check Firefox Downloads.' })
 	}
 }
@@ -499,5 +570,9 @@ function workIt(buggyBlob, duration){
 
 function delay(duration) {
 	return new Promise(resolve => setTimeout(resolve, duration))
+}
+
+function padSegmentNumber(segmentNumber) {
+	return String(segmentNumber).padStart(3, '0')
 }
 
