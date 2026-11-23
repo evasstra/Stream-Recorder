@@ -87,6 +87,8 @@ export default class LiveRecorder extends HyperHTMLElement {
 			this.captureCleanup = null
 			this.audioSource = null
 			this.stopPromise = null
+			this.stopPending = false
+			this.handleCaptureEnd = () => this.requestStop()
 			this.captureStrategy = null
 			this.recordingStream = null
 			this.segmentNumber = 1
@@ -115,11 +117,6 @@ export default class LiveRecorder extends HyperHTMLElement {
 			}
 
 			this.fileTitle = title
-
-			// for ( let ev of [ 'ended', 'stalled', 'seeking', 'waiting', 'emptied' ] ) {
-			//  // Note: handlePause argument removed since making this.
-			// 	this.targetElement.addEventListener(ev, () => this.handlePause(true))
-			// }
 
 			this.render()
 		}
@@ -236,7 +233,7 @@ export default class LiveRecorder extends HyperHTMLElement {
 	async handleClose() {
 		if (this.operation != null) return
 		this.classList.add('live-recorder-none')
-		await this.stop()
+		await this.requestStop()
 	}
 
 	async handleStatus() {
@@ -280,13 +277,27 @@ export default class LiveRecorder extends HyperHTMLElement {
 	}
 
 	async handleStartStop(){
+		if (this.recordingStream != null) return this.requestStop()
 		if (this.operation != null) return
-		if (this.state == null) this.setState(this.defaultState)
-		await this.handleStatus()
-		this.operation = this.state.recorder.state === 'inactive' ? 'starting' : 'stopping'
+		this.operation = 'starting'
 		try {
-			if (this.state.recorder.state === 'inactive') await this.start()
-			else await this.stop()
+			await this.handleStatus()
+			await this.start()
+		} finally {
+			this.operation = null
+			if (this.stopPending) await this.requestStop()
+		}
+	}
+
+	async requestStop() {
+		if (this.recordingStream == null || this.operation === 'stopping') return
+		if (this.operation != null) {
+			this.stopPending = true
+			return
+		}
+		this.operation = 'stopping'
+		try {
+			await this.stop()
 		} finally {
 			this.operation = null
 		}
@@ -302,6 +313,9 @@ export default class LiveRecorder extends HyperHTMLElement {
 			this.recordingStream = stream
 			this.captureCleanup = capture.cleanup
 			this.captureStrategy = capture.strategy
+			for (const event of ['ended', 'emptied', 'error']) {
+				this.targetElement.addEventListener(event, this.handleCaptureEnd)
+			}
 
 			if (capture.strategy === 'mozCaptureStream' && stream.getAudioTracks().length > 0) {
 				try {
@@ -335,6 +349,7 @@ export default class LiveRecorder extends HyperHTMLElement {
 		recorder.onpause = log
 		recorder.onresume = log
 		this.stopPromise = new Promise(resolve => { recorder.onstop = resolve })
+		recorder.addEventListener('stop', this.handleCaptureEnd)
 		recorder.onerror = e => {
 			if (this.operation != null) return
 			this.operation = 'stopping'
@@ -361,6 +376,7 @@ export default class LiveRecorder extends HyperHTMLElement {
 			} finally {
 				this.operation = null
 				this.rolloverScheduled = false
+				if (this.stopPending) await this.requestStop()
 			}
 		})
 	}
@@ -370,11 +386,13 @@ export default class LiveRecorder extends HyperHTMLElement {
 		if (!recorder || recorder.state === 'inactive') return
 
 		this.timer.stop()
+		recorder.removeEventListener('stop', this.handleCaptureEnd)
 		recorder.stop()
 		if (this.stopPromise != null) {
 			await Promise.race([this.stopPromise, delay(STOP_TIMEOUT)])
 		}
 
+		if (this.stopPending) return
 		const completedData = this.data
 		const completedDuration = this.timer.elapsedTime()
 		const completedSegmentNumber = this.segmentNumber
@@ -421,21 +439,27 @@ export default class LiveRecorder extends HyperHTMLElement {
 
 	async stop() {
 		const recorder = this.state.recorder
-		if (recorder && recorder.state !== 'inactive') {
-			this.timer.stop()
-			recorder.stop()
-			if (this.stopPromise != null) {
-				await Promise.race([this.stopPromise, delay(STOP_TIMEOUT)])
-			}
+		this.timer.stop()
+		if (typeof recorder.stop === 'function') {
+			recorder.removeEventListener('stop', this.handleCaptureEnd)
+			if (recorder.state !== 'inactive') recorder.stop()
+		}
+		if (this.stopPromise != null) {
+			// Firefox can mark the recorder inactive before delivering its final chunk.
+			await Promise.race([this.stopPromise, delay(STOP_TIMEOUT)])
 		}
 		await this.cleanupCapture()
 		this.recordingStream = null
+		this.stopPending = false
 		this.stopPromise = null
 		this.setState({ recorder: { state: 'inactive' } })
 		await this.save()
 	}
 
 	async cleanupCapture() {
+		for (const event of ['ended', 'emptied', 'error']) {
+			this.targetElement.removeEventListener(event, this.handleCaptureEnd)
+		}
 		if (this.audioSource != null) {
 			try { this.audioSource.disconnect() } catch(e) { /* nop */ }
 			this.audioSource = null
