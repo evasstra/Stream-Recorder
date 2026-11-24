@@ -7,6 +7,8 @@ import timer from 'minimal-timer'
 const CHUNKSIZE = 500
 const START_TIMEOUT = 5000
 const STOP_TIMEOUT = 5000
+const MAX_TRANSIENT_RESTARTS = 3
+const STABLE_RECORDING_DURATION = 30000
 const WORKER_TIMEOUT = 10000
 const WEBM_TYPES = [
 	'video/webm;codecs=vp8,opus',
@@ -124,7 +126,7 @@ export default class LiveRecorder extends HyperHTMLElement {
 
 	render() {
 		const {recorder, error} = this.state
-		const recording = recorder.state !== 'inactive'
+		const recording = this.recordingStream != null
 		const paused = recorder.state === 'paused'
 		const errored = error === '' ? 'live-recorder-none' : ''
 		const realError = !error.startsWith('Whoops');
@@ -231,7 +233,7 @@ export default class LiveRecorder extends HyperHTMLElement {
 	}
 
 	async handleClose() {
-		if (this.operation != null) return
+		if (this.operation != null && !this.recordingStream) return
 		this.classList.add('live-recorder-none')
 		await this.requestStop()
 	}
@@ -285,7 +287,7 @@ export default class LiveRecorder extends HyperHTMLElement {
 			await this.start()
 		} finally {
 			this.operation = null
-			if (this.stopPending) await this.requestStop()
+			await this.finishPendingOperation()
 		}
 	}
 
@@ -305,6 +307,8 @@ export default class LiveRecorder extends HyperHTMLElement {
 
 	async start() {
 		try {
+			this.transientRestarts = 0
+			this.pendingRecorderError = null
 			this.segmentNumber = 1
 			this.isSegmentedRecording = false
 			await this.targetElement.play()
@@ -351,13 +355,34 @@ export default class LiveRecorder extends HyperHTMLElement {
 		this.stopPromise = new Promise(resolve => { recorder.onstop = resolve })
 		recorder.addEventListener('stop', this.handleCaptureEnd)
 		recorder.onerror = e => {
-			if (this.operation != null) return
-			this.operation = 'stopping'
-			this.error(e.error || recorderError('MediaRecorderError', 'Recording failed.'))
-				.finally(() => { this.operation = null })
+			if (data !== this.data || this.operation === 'stopping') return
+			// The stop event following a recorder error belongs to this segment.
+			// End events from the player must still cancel any pending restart.
+			recorder.removeEventListener('stop', this.handleCaptureEnd)
+			this.pendingRecorderError = e.error || recorderError('MediaRecorderError', 'Recording failed.')
+			if (this.operation == null) this.finishPendingOperation()
 		}
 		await startRecorder(recorder, CHUNKSIZE, START_TIMEOUT)
 		return recorder
+	}
+
+	async finishPendingOperation() {
+		if (this.stopPending) return this.requestStop()
+		const error = this.pendingRecorderError
+		if (!error || !this.recordingStream) return
+		this.pendingRecorderError = null
+		if (this.timer.elapsedTime() >= STABLE_RECORDING_DURATION) this.transientRestarts = 0
+		if (error.name === 'UnknownError' && this.transientRestarts < MAX_TRANSIENT_RESTARTS) {
+			this.transientRestarts += 1
+			await this.runRollover(true)
+		} else {
+			this.operation = 'stopping'
+			try {
+				await this.error(error)
+			} finally {
+				this.operation = null
+			}
+		}
 	}
 
 	scheduleRollover() {
@@ -368,31 +393,42 @@ export default class LiveRecorder extends HyperHTMLElement {
 				this.rolloverScheduled = false
 				return
 			}
-			this.operation = 'rolling-over'
-			try {
-				await this.rollover()
-			} catch(e) {
-				await this.error(e)
-			} finally {
-				this.operation = null
-				this.rolloverScheduled = false
-				if (this.stopPending) await this.requestStop()
-			}
+			this.rolloverScheduled = false
+			await this.runRollover(false)
 		})
 	}
 
-	async rollover() {
-		const recorder = this.state.recorder
-		if (!recorder || recorder.state === 'inactive') return
+	async runRollover(recovering) {
+		this.operation = recovering ? 'restarting' : 'rolling-over'
+		try {
+			await this.rollover(recovering)
+		} catch(e) {
+			await this.error(e)
+		} finally {
+			this.operation = null
+			await this.finishPendingOperation()
+		}
+	}
 
+	async rollover(recovering) {
+		const recorder = this.state.recorder
+		if (!recovering && recorder.state === 'inactive') return
+
+		const wasPaused = !this.timer.isRunning()
 		this.timer.stop()
+		recorder.onerror = null
 		recorder.removeEventListener('stop', this.handleCaptureEnd)
-		recorder.stop()
+		if (recorder.state !== 'inactive') recorder.stop()
 		if (this.stopPromise != null) {
 			await Promise.race([this.stopPromise, delay(STOP_TIMEOUT)])
 		}
 
 		if (this.stopPending) return
+		if (recovering && (this.targetElement.ended || this.targetElement.error ||
+			!this.recordingStream.getTracks().some(track => track.readyState === 'live'))) {
+			this.stopPending = true
+			return
+		}
 		const completedData = this.data
 		const completedDuration = this.timer.elapsedTime()
 		const completedSegmentNumber = this.segmentNumber
@@ -411,10 +447,14 @@ export default class LiveRecorder extends HyperHTMLElement {
 		}
 		this.segmentNumber += 1
 		this.timer.start()
+		if (wasPaused && nextRecorder.state === 'recording') {
+			nextRecorder.pause()
+			this.timer.stop()
+		}
 		this.setState({ recorder: nextRecorder })
 
 		await this.save(completedData, completedDuration, completedSegmentNumber, true)
-		this.setState({
+		if (completedData.length && !this.stopPending && !this.pendingRecorderError) this.setState({
 			error: 'Whoops: Part ' + padSegmentNumber(completedSegmentNumber) + ' saved. Recording continues.'
 		})
 	}
@@ -450,6 +490,7 @@ export default class LiveRecorder extends HyperHTMLElement {
 		}
 		await this.cleanupCapture()
 		this.recordingStream = null
+		this.pendingRecorderError = null
 		this.stopPending = false
 		this.stopPromise = null
 		this.setState({ recorder: { state: 'inactive' } })
